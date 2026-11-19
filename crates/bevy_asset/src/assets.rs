@@ -598,6 +598,7 @@ impl<A: Asset> Assets<A> {
         use AssetEvent::{Added, LoadedWithDependencies, Modified, Removed};
 
         if let Some(mut asset_changes) = asset_changes {
+            asset_changes.begin_flush(ticks.this_run());
             for new_event in &assets.queued_events {
                 match new_event {
                     Removed { id } | AssetEvent::Unused { id } => asset_changes.remove(id),

@@ -4,6 +4,7 @@
 //! and triggers whenever the handle or the underlying asset changes.
 
 use crate::{AsAssetId, Asset, AssetId};
+use alloc::vec::Vec;
 use bevy_ecs::component::Components;
 use bevy_ecs::{
     archetype::Archetype,
@@ -21,6 +22,9 @@ use core::marker::PhantomData;
 use disqualified::ShortName;
 use tracing::error;
 
+/// A check against more recent changes than this looks each handle up in the map of every change.
+const MOST_RECENT_CHANGES_COMPARED_ONE_BY_ONE: usize = 16;
+
 /// A resource that stores the last tick an asset was changed. This is used by
 /// the [`AssetChanged`] filter to determine if an asset has changed since the last time
 /// a query ran.
@@ -33,15 +37,37 @@ use tracing::error;
 pub(crate) struct AssetChanges<A: Asset> {
     change_ticks: HashMap<AssetId<A>, Tick>,
     last_change_tick: Tick,
+    /// The changes of the two latest flushes of asset events. A game that rewrites one asset
+    /// every frame, such as a particle mesh, would otherwise make every `AssetChanged` filter
+    /// hash every handle it visits into `change_ticks` every frame.
+    recent_changes: Vec<(AssetId<A>, Tick)>,
+    latest_flush_tick: Tick,
+    /// Every change newer than this tick is in `recent_changes`.
+    recent_changes_complete_since: Tick,
 }
 
 impl<A: Asset> AssetChanges<A> {
+    pub(crate) fn begin_flush(&mut self, tick: Tick) {
+        let latest_flush_tick = self.latest_flush_tick;
+        self.recent_changes_complete_since = self
+            .recent_changes
+            .iter()
+            .map(|(_, change_tick)| *change_tick)
+            .find(|change_tick| *change_tick != latest_flush_tick)
+            .unwrap_or(self.recent_changes_complete_since);
+        self.recent_changes
+            .retain(|(_, change_tick)| *change_tick == latest_flush_tick);
+        self.latest_flush_tick = tick;
+    }
     pub(crate) fn insert(&mut self, asset_id: AssetId<A>, tick: Tick) {
         self.last_change_tick = tick;
         self.change_ticks.insert(asset_id, tick);
+        self.recent_changes.push((asset_id, tick));
     }
     pub(crate) fn remove(&mut self, asset_id: &AssetId<A>) {
         self.change_ticks.remove(asset_id);
+        self.recent_changes
+            .retain(|(changed_id, _)| changed_id != asset_id);
     }
 }
 
@@ -50,6 +76,9 @@ impl<A: Asset> Default for AssetChanges<A> {
         Self {
             change_ticks: Default::default(),
             last_change_tick: Tick::new(0),
+            recent_changes: Vec::new(),
+            latest_flush_tick: Tick::new(0),
+            recent_changes_complete_since: Tick::new(0),
         }
     }
 }
@@ -58,6 +87,8 @@ struct AssetChangeCheck<'w, A: AsAssetId> {
     // This should never be `None` in practice, but we need to handle the case
     // where the `AssetChanges` resource was removed.
     change_ticks: Option<&'w HashMap<AssetId<A::Asset>, Tick>>,
+    /// Every change this check can see, when they are few enough to compare one by one.
+    recent_changes: Option<&'w [(AssetId<A::Asset>, Tick)]>,
     last_run: Tick,
     this_run: Tick,
 }
@@ -72,8 +103,14 @@ impl<A: AsAssetId> Copy for AssetChangeCheck<'_, A> {}
 
 impl<'w, A: AsAssetId> AssetChangeCheck<'w, A> {
     fn new(changes: &'w AssetChanges<A::Asset>, last_run: Tick, this_run: Tick) -> Self {
+        let recent_changes_cover_this_check = !changes
+            .recent_changes_complete_since
+            .is_newer_than(last_run, this_run)
+            && changes.recent_changes.len() <= MOST_RECENT_CHANGES_COMPARED_ONE_BY_ONE;
         Self {
             change_ticks: Some(&changes.change_ticks),
+            recent_changes: recent_changes_cover_this_check
+                .then_some(changes.recent_changes.as_slice()),
             last_run,
             this_run,
         }
@@ -84,6 +121,11 @@ impl<'w, A: AsAssetId> AssetChangeCheck<'w, A> {
         let is_newer = |tick: &Tick| tick.is_newer_than(self.last_run, self.this_run);
         let id = handle.as_asset_id();
 
+        if let Some(recent_changes) = self.recent_changes {
+            return recent_changes
+                .iter()
+                .any(|(changed_id, tick)| *changed_id == id && is_newer(tick));
+        }
         self.change_ticks
             .is_some_and(|change_ticks| change_ticks.get(&id).is_some_and(is_newer))
     }
@@ -187,6 +229,7 @@ unsafe impl<A: AsAssetId> WorldQuery for AssetChanged<A> {
                 inner: None,
                 check: AssetChangeCheck {
                     change_ticks: None,
+                    recent_changes: None,
                     last_run,
                     this_run,
                 },
