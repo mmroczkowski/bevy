@@ -10,6 +10,12 @@ use super::{IterQueryData, QueryFilter, QueryItem, QueryState, ReadOnlyQueryData
 
 use alloc::vec::Vec;
 
+/// Opening a task pool scope and waking its threads costs more than iterating this many items on
+/// the calling thread, which matters to the many systems that run a parallel iterator every frame
+/// over a query matching a handful of entities.
+#[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+const ITEMS_ITERATED_WITHOUT_TASKS: usize = 4096;
+
 /// A parallel iterator over query results of a [`Query`](crate::system::Query).
 ///
 /// This struct is created by the [`Query::par_iter`](crate::system::Query::par_iter) and
@@ -103,7 +109,12 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
         #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
         {
             let thread_count = bevy_tasks::ComputeTaskPool::get().thread_num();
-            if thread_count <= 1 {
+            let batch_size = if thread_count <= 1 {
+                0
+            } else {
+                self.get_batch_size(thread_count).max(1)
+            };
+            if thread_count <= 1 || self.matched_item_bound() <= ITEMS_ITERATED_WITHOUT_TASKS {
                 let init = init();
                 // SAFETY: See the safety comment above.
                 unsafe {
@@ -113,8 +124,6 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
                         .fold(init, func);
                 }
             } else {
-                // Need a batch size of at least 1.
-                let batch_size = self.get_batch_size(thread_count).max(1);
                 // SAFETY: See the safety comment above.
                 unsafe {
                     self.state.par_fold_init_unchecked_manual(
@@ -127,6 +136,25 @@ impl<'w, 's, D: IterQueryData, F: QueryFilter> QueryParIter<'w, 's, D, F> {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
+    fn matched_item_bound(&self) -> usize {
+        let id_iter = self.state.matched_storage_ids.iter();
+        if self.state.is_dense {
+            // SAFETY: We only access table metadata.
+            let tables = unsafe { &self.world.world_metadata().storages().tables };
+            id_iter
+                // SAFETY: The if check ensures that matched_storage_ids stores TableIds
+                .map(|id| unsafe { tables[id.table_id].entity_count() } as usize)
+                .sum()
+        } else {
+            let archetypes = &self.world.archetypes();
+            id_iter
+                // SAFETY: The if check ensures that matched_storage_ids stores ArchetypeIds
+                .map(|id| unsafe { archetypes[id.archetype_id].len() } as usize)
+                .sum()
         }
     }
 
