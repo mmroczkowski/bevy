@@ -15,12 +15,13 @@ use bevy_camera::{
     },
     Camera, Camera3d, CameraUpdateSystems, RenderTarget, ShadowLodOrigin,
 };
-use bevy_ecs::{entity::EntityHashSet, prelude::*, system::QueryLens};
+use bevy_ecs::{entity::EntityHashSet, prelude::*, query::QueryState, system::QueryLens};
 #[cfg(feature = "bevy_gizmos")]
 use bevy_gizmos::frustum::FrustumGizmoSystems;
 use bevy_log::warn_once;
 use bevy_math::Vec3A;
 use bevy_mesh::Mesh3d;
+use bevy_platform::sync::{Arc, Mutex, PoisonError};
 use bevy_reflect::prelude::*;
 use bevy_transform::{components::GlobalTransform, TransformSystems};
 use bevy_utils::Parallel;
@@ -371,6 +372,7 @@ pub fn check_dir_light_mesh_visibility(
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
     mut defer_visible_entities_queue: Local<Parallel<Vec<Entity>>>,
     mut view_visible_entities_queue: Local<Parallel<Vec<Vec<Entity>>>>,
+    shadow_caster_view_visibilities: Local<ShadowCasterViewVisibilities>,
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
 
@@ -498,8 +500,12 @@ pub fn check_dir_light_mesh_visibility(
     // Defer marking view visibility so this system can run in parallel with check_point_light_mesh_visibility
     // TODO: use resource to avoid unnecessary memory alloc
     let mut defer_queue = mem::take(defer_visible_entities_queue.deref_mut());
+    let view_visibilities = Arc::clone(&shadow_caster_view_visibilities.0);
     commands.queue(move |world: &mut World| {
-        let mut query = world.query::<&mut ViewVisibility>();
+        let mut view_visibilities = view_visibilities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let query = view_visibilities.get_or_insert_with(|| world.query::<&mut ViewVisibility>());
         for entities in defer_queue.iter_mut() {
             let mut iter = query.iter_many_mut(world, entities.iter()).matched();
             while let Some(mut view_visibility) = iter.fetch_next() {
@@ -508,6 +514,13 @@ pub fn check_dir_light_mesh_visibility(
         }
     });
 }
+
+/// The query marking the entities a directional light's shadow shows visible, kept across frames
+/// as making one matches it against every archetype of the world.
+#[derive(Default)]
+pub struct ShadowCasterViewVisibilities(
+    Arc<Mutex<Option<QueryState<&'static mut ViewVisibility>>>>,
+);
 
 /// Updates the visibility for [`PointLight`]s and [`SpotLight`]s so that shadow
 /// map rendering can work.
