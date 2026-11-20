@@ -5,6 +5,7 @@ pub(crate) mod mesh;
 mod mesh_bindings;
 mod mesh_view_bindings;
 mod morph;
+mod scene_unpacking_bind_groups_made_lately;
 pub(crate) mod skin;
 
 pub use fog::*;
@@ -14,6 +15,7 @@ pub use mesh::*;
 pub use mesh_bindings::MeshLayouts;
 pub use mesh_view_bindings::*;
 pub use morph::*;
+pub use scene_unpacking_bind_groups_made_lately::SceneUnpackingBindGroupsMadeLately;
 pub use skin::{extract_skins, prepare_skins, skins_use_uniform_buffers, SkinUniforms, MAX_JOINTS};
 
 pub const CORE_3D_SHADOW_MAP_FORMAT: wgpu_types::TextureFormat =
