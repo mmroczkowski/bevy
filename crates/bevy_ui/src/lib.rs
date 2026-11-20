@@ -201,7 +201,9 @@ impl Plugin for UiPlugin {
                 ui_layout_system
                     .in_set(UiSystems::Layout)
                     .ambiguous_with(bevy_sprite::update_text2d_layout),
-                ui_stack_system.in_set(UiSystems::Stack),
+                ui_stack_system
+                    .run_if(stack::ui_stack_inputs_changed)
+                    .in_set(UiSystems::Stack),
                 update_clipping_system.in_set(UiSystems::PostLayout),
                 // Potential conflicts: `Assets<Image>`
                 // They run independently since `widget::image_node_system` will only ever observe

@@ -44,6 +44,46 @@ pub(crate) struct StackRoot {
     previous_index: usize,
 }
 
+/// Nodes whose place in the stack may have moved, as they came, changed z-index or moved in the
+/// hierarchy, or whose children did.
+type NodesMovedInTheStack = (
+    With<ComputedStackIndex>,
+    Or<(
+        Added<ComputedStackIndex>,
+        Changed<Children>,
+        Changed<ChildOf>,
+        Changed<ZIndex>,
+        Changed<GlobalZIndex>,
+    )>,
+);
+
+/// Whether a node's place in the stack may have moved since the stack was built, so that a
+/// frame changing none of what the stack is built from keeps it. With ghost nodes, which this
+/// does not watch, the stack is always built anew.
+pub fn ui_stack_inputs_changed(
+    moved_nodes: Query<(), NodesMovedInTheStack>,
+    (
+        mut removed_nodes,
+        mut removed_children,
+        mut removed_parents,
+        mut removed_z,
+        mut removed_global_z,
+    ): (
+        RemovedComponents<ComputedStackIndex>,
+        RemovedComponents<Children>,
+        RemovedComponents<ChildOf>,
+        RemovedComponents<ZIndex>,
+        RemovedComponents<GlobalZIndex>,
+    ),
+) -> bool {
+    let removals = removed_nodes.read().count()
+        + removed_children.read().count()
+        + removed_parents.read().count()
+        + removed_z.read().count()
+        + removed_global_z.read().count();
+    cfg!(feature = "ghost_nodes") || removals > 0 || !moved_nodes.is_empty()
+}
+
 /// Generates the render stack for UI nodes.
 ///
 /// Create a list of `StackRoot`s from parentless entities and entities with a `GlobalZIndex` component.
@@ -177,14 +217,14 @@ mod tests {
     use bevy_ecs::{
         component::Component,
         hierarchy::ChildOf,
-        schedule::Schedule,
+        schedule::{IntoScheduleConfigs, Schedule},
         system::Commands,
         world::{CommandQueue, World},
     };
 
     use crate::{GlobalZIndex, Node, UiStack, ZIndex};
 
-    use super::ui_stack_system;
+    use super::{ui_stack_inputs_changed, ui_stack_system};
 
     #[derive(Component, PartialEq, Debug, Clone)]
     struct Label(&'static str);
@@ -466,5 +506,36 @@ mod tests {
         schedule.run(&mut world);
 
         assert_eq!(uinodes, world.resource::<UiStack>().uinodes);
+    }
+
+    #[test]
+    fn a_kept_stack_follows_a_later_change_of_z_index_and_hierarchy() {
+        let mut world = World::default();
+        world.init_resource::<UiStack>();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(ui_stack_system.run_if(ui_stack_inputs_changed));
+
+        let parent = world.spawn(Node::default()).id();
+        let below = world.spawn((Node::default(), ChildOf(parent))).id();
+        let above = world.spawn((Node::default(), ChildOf(parent))).id();
+        schedule.run(&mut world);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [parent, below, above]);
+
+        world.entity_mut(below).insert(ZIndex(1));
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<UiStack>().uinodes, [parent, above, below]);
+
+        world.entity_mut(above).remove::<ChildOf>();
+        schedule.run(&mut world);
+        schedule.run(&mut world);
+        let uinodes = &world.resource::<UiStack>().uinodes;
+        assert_eq!(uinodes.len(), 3);
+        assert_eq!(world.resource::<UiStack>().partition.len(), 2);
+
+        world.entity_mut(below).despawn();
+        schedule.run(&mut world);
+        assert!(!world.resource::<UiStack>().uinodes.contains(&below));
     }
 }
