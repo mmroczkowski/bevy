@@ -48,7 +48,7 @@ use crate::batching::gpu_preprocessing::{
     PhaseIndirectParametersBuffers,
 };
 use crate::render_resource::{RawBufferVec, UninitBufferVec};
-use crate::renderer::RenderDevice;
+use crate::renderer::{RenderDevice, RenderQueue};
 use crate::sync_world::{MainEntity, MainEntityHashMap};
 use crate::view::{ExtractedView, RetainedViewEntity};
 use crate::RenderDebugFlags;
@@ -243,6 +243,10 @@ pub struct RenderMultidrawableBatchSetGpuBuffers {
     /// A temporary buffer used to store intermediate sums during the uniform
     /// allocation phase.
     pub fan_buffer: UninitBufferVec<u32>,
+
+    /// Whether an instance or bin came or went since the buffers were last written, as the GPU
+    /// keeps what was written until then.
+    changed_since_written: bool,
 }
 
 impl RenderMultidrawableBatchSetGpuBuffers {
@@ -263,7 +267,27 @@ impl RenderMultidrawableBatchSetGpuBuffers {
             bin_metadata_buffer,
             bin_index_to_bin_metadata_index_buffer,
             fan_buffer,
+            changed_since_written: true,
         }
+    }
+
+    /// Writes the buffers to the GPU if an instance or bin came or went since they were last
+    /// written.
+    pub(crate) fn write_changes(
+        &mut self,
+        render_device: &RenderDevice,
+        render_queue: &RenderQueue,
+    ) {
+        if self.changed_since_written {
+            self.render_binned_mesh_instance_buffer
+                .write_buffer(render_device, render_queue);
+            self.bin_metadata_buffer
+                .write_buffer(render_device, render_queue);
+            self.bin_index_to_bin_metadata_index_buffer
+                .write_buffer(render_device, render_queue);
+            self.changed_since_written = false;
+        }
+        self.fan_buffer.write_buffer(render_device);
     }
 
     /// Inserts an entity into the GPU buffers and returns its index.
@@ -551,6 +575,7 @@ where
         main_entity: MainEntity,
         input_uniform_index: InputUniformIndex,
     ) {
+        self.gpu_buffers.changed_since_written = true;
         let bin_index;
         match self.bin_key_to_bin_index.entry(bin_key) {
             Entry::Occupied(occupied_entry) => {
@@ -602,6 +627,7 @@ where
     ///
     /// The given entity must be present in that bin.
     fn remove(&mut self, main_entity: MainEntity, bin_key: &BPI::BinKey) {
+        self.gpu_buffers.changed_since_written = true;
         // Fetch the bin index.
         let bin_index = *self
             .bin_key_to_bin_index
