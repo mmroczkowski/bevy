@@ -102,6 +102,36 @@ impl StaticTransformOptimizations {
     }
 }
 
+/// Up to this many transforms, marking dirty trees on the calling thread takes a fraction of
+/// opening a task pool scope and its channels for the frame.
+#[cfg(feature = "multi_threaded")]
+const MOST_TRANSFORMS_MARKED_SERIALLY: usize = 16_384;
+
+/// Iterates changed entities and traverses the tree on the calling thread.
+fn mark_dirty_trees_serially(
+    changed: &Query<Entity, Or<(Changed<Transform>, Changed<ChildOf>, Added<GlobalTransform>)>>,
+    orphaned: &mut RemovedComponents<ChildOf>,
+    transforms: &mut Query<&mut TransformTreeChanged>,
+    parents: &Query<&ChildOf>,
+) {
+    for entity in changed.iter().chain(orphaned.read()) {
+        let mut next = entity;
+        while let Ok(mut tree) = transforms.get_mut(next) {
+            if tree.is_changed() && !tree.is_added() {
+                // If the component was changed, this part of the tree has already been processed.
+                // Ignore this if the change was caused by the component being added.
+                break;
+            }
+            tree.set_changed();
+            if let Ok(parent) = parents.get(next).map(ChildOf::parent) {
+                next = parent;
+            } else {
+                break;
+            };
+        }
+    }
+}
+
 /// Optimization for static scenes.
 ///
 /// Propagates a "dirty bit" up the hierarchy towards ancestors. Transform propagation can ignore
@@ -132,23 +162,13 @@ pub fn mark_dirty_trees(
         return;
     }
 
-    // Simple serial implementation that iterates changed entities and traverses the tree.
     #[cfg(not(feature = "multi_threaded"))]
-    for entity in changed.iter().chain(orphaned.read()) {
-        let mut next = entity;
-        while let Ok(mut tree) = transforms.get_mut(next) {
-            if tree.is_changed() && !tree.is_added() {
-                // If the component was changed, this part of the tree has already been processed.
-                // Ignore this if the change was caused by the component being added.
-                break;
-            }
-            tree.set_changed();
-            if let Ok(parent) = parents.get(next).map(ChildOf::parent) {
-                next = parent;
-            } else {
-                break;
-            };
-        }
+    mark_dirty_trees_serially(&changed, &mut orphaned, &mut transforms, &parents);
+
+    #[cfg(feature = "multi_threaded")]
+    if transforms.iter().len() <= MOST_TRANSFORMS_MARKED_SERIALLY {
+        mark_dirty_trees_serially(&changed, &mut orphaned, &mut transforms, &parents);
+        return;
     }
 
     // Concurrent and parallel implementation with three sets of asynchronous workers:
