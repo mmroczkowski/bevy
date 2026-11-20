@@ -135,7 +135,9 @@ impl<A: ErasedRenderAsset, AFTER: ErasedRenderAssetDependency + 'static> Plugin
                 );
             AFTER::register_system(
                 render_app,
-                prepare_erased_assets::<A>.in_set(RenderSystems::PrepareAssets),
+                prepare_erased_assets::<A>
+                    .run_if(any_asset_to_prepare::<A>)
+                    .in_set(RenderSystems::PrepareAssets),
             );
         }
     }
@@ -358,6 +360,17 @@ impl<A: ErasedRenderAsset> Default for PrepareNextFrameAssets<A> {
             assets: Default::default(),
         }
     }
+}
+
+/// Preparing fetches every resource the assets' preparation may need, so it is skipped while no
+/// asset was extracted, removed or left for this frame.
+fn any_asset_to_prepare<A: ErasedRenderAsset>(
+    extracted_assets: Res<ExtractedAssets<A>>,
+    prepare_next_frame: Res<PrepareNextFrameAssets<A>>,
+) -> bool {
+    !extracted_assets.extracted.is_empty()
+        || !extracted_assets.removed.is_empty()
+        || !prepare_next_frame.assets.is_empty()
 }
 
 /// This system prepares all assets of the corresponding [`ErasedRenderAsset::SourceAsset`] type
