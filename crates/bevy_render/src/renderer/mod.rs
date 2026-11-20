@@ -1,3 +1,4 @@
+mod bind_group_reuse;
 #[cfg(feature = "raw_vulkan_init")]
 pub mod raw_vulkan_init;
 mod render_context;
@@ -92,6 +93,7 @@ pub fn render_system(
     let _span = info_span!("main_render_schedule").entered();
 
     world.run_schedule(RenderGraph);
+    world.resource::<RenderDevice>().end_bind_group_frame();
 
     {
         let render_device = world.resource::<RenderDevice>();

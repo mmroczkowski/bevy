@@ -3,7 +3,9 @@ use crate::render_resource::{
     BindGroup, BindGroupLayout, Buffer, ComputePipeline, RawMeshPipelineDescriptor,
     RawRenderPipelineDescriptor, RenderPipeline, Sampler, Texture,
 };
+use crate::renderer::bind_group_reuse::{BindGroupKey, BindGroupsMadeLately};
 use crate::renderer::wgpu_wrapper;
+use alloc::sync::Arc;
 use bevy_ecs::resource::Resource;
 use wgpu::{
     util::DeviceExt, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
@@ -19,6 +21,7 @@ wgpu_wrapper! {
 #[derive(Resource, Clone)]
 pub struct RenderDevice {
     device: WgpuDevice,
+    bind_groups_made_lately: Arc<BindGroupsMadeLately>,
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -31,6 +34,7 @@ impl RenderDevice {
     pub fn new(device: wgpu::Device) -> Self {
         Self {
             device: WgpuDevice::new(device),
+            bind_groups_made_lately: Arc::default(),
         }
     }
 
@@ -157,12 +161,29 @@ impl RenderDevice {
         layout: &'a BindGroupLayout,
         entries: &'a [BindGroupEntry<'a>],
     ) -> BindGroup {
-        let wgpu_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: label.into(),
+        let key = BindGroupKey::of(layout, entries);
+        if let Some(made) = key
+            .as_ref()
+            .and_then(|key| self.bind_groups_made_lately.take(key))
+        {
+            return made;
+        }
+        let label = label.into();
+        let bind_group = BindGroup::from(self.device.create_bind_group(&BindGroupDescriptor {
+            label,
             layout,
             entries,
-        });
-        BindGroup::from(wgpu_bind_group)
+        }));
+        if let Some(key) = key {
+            self.bind_groups_made_lately.keep(key, &bind_group);
+        }
+        bind_group
+    }
+
+    /// Ends a frame of [`Self::create_bind_group`]: a bind group no frame has asked for since the
+    /// one before last is let go.
+    pub fn end_bind_group_frame(&self) {
+        self.bind_groups_made_lately.end_frame();
     }
 
     /// Creates a [`BindGroupLayout`](wgpu::BindGroupLayout).
