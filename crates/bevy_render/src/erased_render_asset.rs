@@ -9,7 +9,7 @@ use bevy_ecs::{
     prelude::{Commands, IntoScheduleConfigs, Local, MessageReader, ResMut, Resource},
     schedule::{ScheduleConfigs, SystemSet},
     system::{ScheduleSystem, StaticSystemParam, SystemParam, SystemParamItem, SystemState},
-    world::{FromWorld, Mut},
+    world::World,
 };
 use bevy_log::{debug, error};
 use bevy_platform::collections::{HashMap, HashSet};
@@ -116,9 +116,7 @@ impl<A: ErasedRenderAsset, AFTER: ErasedRenderAssetDependency + 'static> Default
 impl<A: ErasedRenderAsset, AFTER: ErasedRenderAssetDependency + 'static> Plugin
     for ErasedRenderAssetPlugin<A, AFTER>
 {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<CachedExtractErasedRenderAssetSystemState<A>>();
-    }
+    fn build(&self, _app: &mut App) {}
 
     fn finish(&self, app: &mut App) {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
@@ -228,20 +226,13 @@ impl<ERA> ErasedRenderAssets<ERA> {
     }
 }
 
-#[derive(Resource)]
-struct CachedExtractErasedRenderAssetSystemState<A: ErasedRenderAsset> {
+/// Kept by the extracting system rather than lent out of the main world each frame, as lending a
+/// resource moves its entity between archetypes twice.
+pub(crate) struct CachedExtractErasedRenderAssetSystemState<A: ErasedRenderAsset> {
     state: SystemState<(
         MessageReader<'static, 'static, AssetEvent<A::SourceAsset>>,
         ResMut<'static, Assets<A::SourceAsset>>,
     )>,
-}
-
-impl<A: ErasedRenderAsset> FromWorld for CachedExtractErasedRenderAssetSystemState<A> {
-    fn from_world(world: &mut bevy_ecs::world::World) -> Self {
-        Self {
-            state: SystemState::new(world),
-        }
-    }
 }
 
 /// Resource inserted during [`RenderStartup`] containing asset IDs that need
@@ -282,6 +273,7 @@ pub(crate) fn extract_erased_render_asset<A: ErasedRenderAsset>(
     mut extracted_assets: ResMut<ExtractedAssets<A>>,
     mut main_world: ResMut<MainWorld>,
     mut needs_extracting: Local<HashSet<AssetId<A::SourceAsset>>>,
+    mut cached_state: Local<Option<CachedExtractErasedRenderAssetSystemState<A>>>,
 ) {
     extracted_assets.extracted.clear();
     extracted_assets.removed.clear();
@@ -294,62 +286,63 @@ pub(crate) fn extract_erased_render_asset<A: ErasedRenderAsset>(
         .map(|r| core::mem::take(&mut r.ids))
         .filter(|ids| !ids.is_empty());
 
-    main_world.resource_scope(
-        |world, mut cached_state: Mut<CachedExtractErasedRenderAssetSystemState<A>>| {
-            let (mut events, mut assets) = cached_state.state.get_mut(world).unwrap();
+    let world: &mut World = &mut main_world;
+    let cached_state =
+        cached_state.get_or_insert_with(|| CachedExtractErasedRenderAssetSystemState {
+            state: SystemState::new(world),
+        });
+    let (mut events, mut assets) = cached_state.state.get_mut(world).unwrap();
 
-            if let Some(reextract_ids) = reextract_ids {
-                needs_extracting.extend(reextract_ids);
+    if let Some(reextract_ids) = reextract_ids {
+        needs_extracting.extend(reextract_ids);
+    }
+
+    for event in events.read() {
+        #[expect(
+            clippy::match_same_arms,
+            reason = "LoadedWithDependencies is marked as a TODO, so it's likely this will no longer lint soon."
+        )]
+        match event {
+            AssetEvent::Added { id } => {
+                needs_extracting.insert(*id);
             }
+            AssetEvent::Modified { id } => {
+                needs_extracting.insert(*id);
+                extracted_assets.modified.insert(*id);
+            }
+            AssetEvent::Removed { .. } => {
+                // We don't care that the asset was removed from Assets<T> in the main world.
+                // An asset is only removed from ErasedRenderAssets<T> when its last handle is dropped (AssetEvent::Unused).
+            }
+            AssetEvent::Unused { id } => {
+                needs_extracting.remove(id);
+                extracted_assets.modified.remove(id);
+                extracted_assets.removed.insert(*id);
+            }
+            AssetEvent::LoadedWithDependencies { .. } => {
+                // TODO: handle this
+            }
+        }
+    }
 
-            for event in events.read() {
-                #[expect(
-                    clippy::match_same_arms,
-                    reason = "LoadedWithDependencies is marked as a TODO, so it's likely this will no longer lint soon."
-                )]
-                match event {
-                    AssetEvent::Added { id } => {
-                        needs_extracting.insert(*id);
+    for id in needs_extracting.drain() {
+        if let Some(asset) = assets.get(id) {
+            let asset_usage = A::asset_usage(asset);
+            if asset_usage.contains(RenderAssetUsages::RENDER_WORLD) {
+                if asset_usage == RenderAssetUsages::RENDER_WORLD {
+                    if let Some(asset) = assets.remove(id) {
+                        extracted_assets.extracted.push((id, asset));
+                        extracted_assets.added.insert(id);
                     }
-                    AssetEvent::Modified { id } => {
-                        needs_extracting.insert(*id);
-                        extracted_assets.modified.insert(*id);
-                    }
-                    AssetEvent::Removed { .. } => {
-                        // We don't care that the asset was removed from Assets<T> in the main world.
-                        // An asset is only removed from ErasedRenderAssets<T> when its last handle is dropped (AssetEvent::Unused).
-                    }
-                    AssetEvent::Unused { id } => {
-                        needs_extracting.remove(id);
-                        extracted_assets.modified.remove(id);
-                        extracted_assets.removed.insert(*id);
-                    }
-                    AssetEvent::LoadedWithDependencies { .. } => {
-                        // TODO: handle this
-                    }
+                } else {
+                    extracted_assets.extracted.push((id, asset.clone()));
+                    extracted_assets.added.insert(id);
                 }
             }
+        }
+    }
 
-            for id in needs_extracting.drain() {
-                if let Some(asset) = assets.get(id) {
-                    let asset_usage = A::asset_usage(asset);
-                    if asset_usage.contains(RenderAssetUsages::RENDER_WORLD) {
-                        if asset_usage == RenderAssetUsages::RENDER_WORLD {
-                            if let Some(asset) = assets.remove(id) {
-                                extracted_assets.extracted.push((id, asset));
-                                extracted_assets.added.insert(id);
-                            }
-                        } else {
-                            extracted_assets.extracted.push((id, asset.clone()));
-                            extracted_assets.added.insert(id);
-                        }
-                    }
-                }
-            }
-
-            cached_state.state.apply(world);
-        },
-    );
+    cached_state.state.apply(world);
 }
 
 // TODO: consider storing inside system?
