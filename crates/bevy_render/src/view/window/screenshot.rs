@@ -252,8 +252,10 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
     }
 }
 
-fn clear_screenshots(mut commands: Commands) {
-    commands.despawn_all::<With<Captured>>();
+fn clear_screenshots(mut commands: Commands, captured: Query<Entity, With<Captured>>) {
+    for screenshot in &captured {
+        commands.entity(screenshot).despawn();
+    }
 }
 
 pub fn trigger_screenshots(

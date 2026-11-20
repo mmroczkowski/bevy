@@ -135,11 +135,13 @@ pub struct RootNonCameraView(#[reflect(ignore)] pub InternedScheduleLabel);
 /// graph schedule.
 pub fn camera_driver(
     world: &mut World,
-    state: &mut SystemState<Query<(MainEntity, &ExtractedWindow)>>,
+    (state, auxiliary_views): (
+        &mut SystemState<Query<(MainEntity, &ExtractedWindow)>>,
+        &mut QueryState<Entity, With<RootNonCameraView>>,
+    ),
 ) {
     // Gather up all cameras and auxiliary views not associated with a camera.
     let root_views: Vec<_> = {
-        let mut auxiliary_views = world.query_filtered::<Entity, With<RootNonCameraView>>();
         let sorted = world.resource::<SortedCameras>();
         auxiliary_views
             .iter(world)
@@ -283,15 +285,17 @@ pub(crate) fn submit_pending_command_buffers(
     }
 }
 
-pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
+pub(crate) fn handle_uncovered_swap_chains(
+    world: &mut World,
+    windows: &mut QueryState<(MainEntity, &ExtractedWindow)>,
+) {
     let windows_to_clear: Vec<_> = {
         let clear_color = world.resource::<ClearColor>().0.to_linear();
         let Some(camera_windows) = world.remove_resource::<CameraWindows>() else {
             return;
         };
 
-        world
-            .query::<(MainEntity, &ExtractedWindow)>()
+        windows
             .iter(world)
             .filter_map(|(window_entity, window)| {
                 if camera_windows.0.contains(&window_entity.entity()) {
