@@ -188,6 +188,8 @@ impl RenderResources {
         synchronous_pipeline_compilation: bool,
     ) {
         let RenderResources(device, queue, adapter_info, render_adapter, instance, ..) = self;
+        #[cfg(not(target_arch = "wasm32"))]
+        let device = device.with_submission_sync(queue.submission_sync());
 
         let compressed_image_format_support =
             CompressedImageFormatSupport(CompressedImageFormats::from_features(device.features()));

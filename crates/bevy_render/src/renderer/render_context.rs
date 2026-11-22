@@ -17,16 +17,17 @@ use bevy_ecs::world::DeferredWorld;
 #[cfg(feature = "trace")]
 use bevy_log::info_span;
 #[cfg(not(target_arch = "wasm32"))]
-use bevy_tasks::ComputeTaskPool;
+use bevy_tasks::{ComputeTaskPool, TaskPool};
 use core::marker::PhantomData;
 use wgpu::CommandBuffer;
 
 #[derive(Default)]
 struct PendingCommandBuffersInner {
     commands: Vec<PendingCommandBuffer>,
+    defer_submit_to_render_system: bool,
 }
 
-enum PendingCommandBuffer {
+pub(crate) enum PendingCommandBuffer {
     Buffer(CommandBuffer),
     Encoder {
         encoder: CommandEncoder,
@@ -95,6 +96,58 @@ impl PendingCommandBuffers {
     pub fn len(&self) -> usize {
         self.0.commands.len()
     }
+
+    pub(crate) fn set_defer_submit_to_render_system(&mut self, defer: bool) {
+        self.0.defer_submit_to_render_system = defer;
+    }
+
+    pub fn defers_submit_to_render_system(&self) -> bool {
+        self.0.defer_submit_to_render_system
+    }
+
+    pub(crate) fn take_commands(&mut self) -> Vec<PendingCommandBuffer> {
+        core::mem::take(&mut self.0.commands)
+    }
+}
+
+pub(crate) fn finish_commands_sequential(commands: Vec<PendingCommandBuffer>) -> Vec<CommandBuffer> {
+    #[cfg(feature = "trace")]
+    let _finish_command_buffers_span = info_span!("finish_command_buffers").entered();
+
+    commands
+        .into_iter()
+        .map(|command| match command {
+            PendingCommandBuffer::Buffer(command_buffer) => command_buffer,
+            PendingCommandBuffer::Encoder {
+                encoder,
+                #[cfg(feature = "trace")]
+                name,
+            } => {
+                #[cfg(feature = "trace")]
+                let _span = info_span!("finish_command_buffer", system = name.as_ref()).entered();
+                encoder.finish()
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn finish_commands(
+    commands: Vec<PendingCommandBuffer>,
+    #[cfg(not(target_arch = "wasm32"))] task_pool: Option<&TaskPool>,
+) -> Vec<CommandBuffer> {
+    #[cfg(feature = "trace")]
+    let _finish_command_buffers_span = info_span!("finish_command_buffers").entered();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        finish_sequential(commands.into_iter()).collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let pool = task_pool.unwrap_or_else(|| ComputeTaskPool::get());
+        finish_parallel_on(commands.into_iter(), pool).collect()
+    }
 }
 
 /// Finishes pending command buffers sequentially, preserving their order.
@@ -117,8 +170,16 @@ fn finish_sequential(
 fn finish_parallel(
     commands: impl Iterator<Item = PendingCommandBuffer>,
 ) -> impl Iterator<Item = CommandBuffer> {
+    finish_parallel_on(commands, ComputeTaskPool::get())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finish_parallel_on(
+    commands: impl Iterator<Item = PendingCommandBuffer>,
+    task_pool: &TaskPool,
+) -> impl Iterator<Item = CommandBuffer> {
     let mut command_buffers = Vec::with_capacity(commands.size_hint().0);
-    let mut finished_encoders = ComputeTaskPool::get().scope(|scope| {
+    let mut finished_encoders = task_pool.scope(|scope| {
         for (index, command) in commands.into_iter().enumerate() {
             match command {
                 PendingCommandBuffer::Buffer(command_buffer) => {

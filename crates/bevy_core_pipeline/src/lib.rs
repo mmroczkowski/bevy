@@ -65,7 +65,7 @@ impl Plugin for CorePipelinePlugin {
             RenderGraph,
             (
                 camera_driver.in_set(RenderGraphSystems::Render),
-                (submit_pending_command_buffers, handle_uncovered_swap_chains)
+                (handle_uncovered_swap_chains, submit_pending_command_buffers)
                     .chain()
                     .in_set(RenderGraphSystems::Submit),
             ),

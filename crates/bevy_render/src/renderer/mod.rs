@@ -3,20 +3,24 @@ mod bind_group_reuse;
 pub mod raw_vulkan_init;
 mod render_context;
 mod render_device;
+mod submission;
 mod wgpu_wrapper;
 
 pub use render_context::{
     CurrentView, FlushCommands, PendingCommandBuffers, RenderContext, RenderContextState, ViewQuery,
 };
 pub use render_device::*;
+pub use submission::FrameSubmissionHandle;
 
 pub(crate) use wgpu_wrapper::wgpu_wrapper;
 
 use crate::{
+    render_resource::SurfaceTexture,
     settings::{RenderResources, WgpuSettings, WgpuSettingsPriority},
     sync_world::MainEntity,
     view::{screenshot::SubmitScreenshotCommandsState, ExtractedWindow, ViewTarget},
 };
+use alloc::sync::Arc;
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::schedule::ScheduleLabel;
 use bevy_ecs::{prelude::*, system::SystemState};
@@ -25,6 +29,10 @@ use bevy_log::info_span;
 use bevy_log::{debug, info, warn};
 use bevy_render::camera::ExtractedCamera;
 use bevy_window::RawHandleWrapperHolder;
+use render_context::PendingCommandBuffer;
+use submission::SubmissionCoordinator;
+#[cfg(not(target_arch = "wasm32"))]
+use submission::SubmissionSync;
 use wgpu::{
     Adapter, AdapterInfo, Backends, DeviceType, ForceShaderModelToken, Instance, Queue,
     RequestAdapterOptions, Trace,
@@ -85,64 +93,87 @@ pub fn render_system(
     present_state: &mut SystemState<(
         Query<(&ViewTarget, &ExtractedCamera)>,
         Query<(MainEntity, &mut ExtractedWindow)>,
-        Res<RenderQueue>,
     )>,
     screenshot_state: &mut SystemState<SubmitScreenshotCommandsState>,
 ) {
     #[cfg(feature = "trace")]
     let _span = info_span!("main_render_schedule").entered();
 
+    if let Some(mut pending) = world.get_resource_mut::<PendingCommandBuffers>() {
+        pending.set_defer_submit_to_render_system(true);
+    }
     world.run_schedule(RenderGraph);
+    if let Some(mut pending) = world.get_resource_mut::<PendingCommandBuffers>() {
+        pending.set_defer_submit_to_render_system(false);
+    }
     world.resource::<RenderDevice>().end_bind_group_frame();
 
-    {
+    let has_screenshots = crate::view::screenshot::has_pending_screenshots(world);
+    let has_readbacks = crate::gpu_readback::has_pending_readbacks(world);
+    if has_screenshots || has_readbacks {
         let render_device = world.resource::<RenderDevice>();
-        let render_queue = world.resource::<RenderQueue>();
-
         let mut encoder =
             render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        crate::view::screenshot::submit_screenshot_commands(world, screenshot_state, &mut encoder);
-        crate::gpu_readback::submit_readback_commands(world, &mut encoder);
-
-        render_queue.submit([encoder.finish()]);
-    }
-
-    {
-        #[cfg(feature = "trace")]
-        let _span = info_span!("present_frames").entered();
-
-        if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
-            for (window_entity, mut window) in &mut windows {
-                let view_needs_present = views.iter().any(|(view_target, camera)| {
-                    matches!(
-                        camera.target,
-                        Some(NormalizedRenderTarget::Window(w)) if w.entity() == window_entity
-                    ) && view_target.needs_present()
-                });
-
-                if view_needs_present || window.needs_initial_present {
-                    window.present(&render_queue);
-                    window.needs_initial_present = false;
-                }
-            }
+        if has_screenshots {
+            crate::view::screenshot::submit_screenshot_commands(
+                world,
+                screenshot_state,
+                &mut encoder,
+            );
+        }
+        if has_readbacks {
+            crate::gpu_readback::submit_readback_commands(world, &mut encoder);
         }
 
-        #[cfg(feature = "tracing-tracy")]
-        bevy_log::event!(
-            bevy_log::Level::INFO,
-            message = "finished frame",
-            tracy.frame_mark = true
-        );
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .push_encoder(encoder, "screenshots_and_readbacks");
     }
 
-    crate::view::screenshot::collect_screenshots(world);
+    let mut presents: Vec<SurfaceTexture> = Vec::new();
+    if let Ok((views, mut windows)) = present_state.get_mut(world) {
+        for (window_entity, mut window) in &mut windows {
+            let view_needs_present = views.iter().any(|(view_target, camera)| {
+                matches!(
+                    camera.target,
+                    Some(NormalizedRenderTarget::Window(w)) if w.entity() == window_entity
+                ) && view_target.needs_present()
+            });
+
+            if view_needs_present || window.needs_initial_present {
+                if let Some(surface_texture) = window.swap_chain_texture.take() {
+                    presents.push(surface_texture);
+                }
+                window.needs_initial_present = false;
+            }
+        }
+    }
+
+    let commands = world
+        .get_resource_mut::<PendingCommandBuffers>()
+        .map(|mut pending| pending.take_commands())
+        .unwrap_or_default();
+
+    let synchronous_submit = has_screenshots || has_readbacks;
+    let render_queue = world.resource::<RenderQueue>().clone();
+    render_queue.submit_frame_async(commands, presents, synchronous_submit);
+
+    #[cfg(feature = "tracing-tracy")]
+    bevy_log::event!(
+        bevy_log::Level::INFO,
+        message = "finished frame",
+        tracy.frame_mark = true
+    );
+
+    if has_screenshots {
+        crate::view::screenshot::collect_screenshots(world);
+    }
 }
 
 wgpu_wrapper! {
-    /// This queue is used to enqueue tasks for the GPU to execute asynchronously.
-    #[derive(Resource, Clone)]
-    pub struct RenderQueue(Queue);
+    #[derive(Clone)]
+    struct WgpuQueue(Queue);
 
     /// The handle to the physical device being used for rendering.
     /// See [`Adapter`] for more info.
@@ -156,6 +187,69 @@ wgpu_wrapper! {
     /// The [`AdapterInfo`] of the adapter in use by the renderer.
     #[derive(Resource, Clone)]
     pub struct RenderAdapterInfo(AdapterInfo);
+}
+
+/// This queue is used to enqueue tasks for the GPU to execute asynchronously.
+#[derive(Resource, Clone)]
+pub struct RenderQueue {
+    queue: WgpuQueue,
+    submission: Arc<SubmissionCoordinator>,
+}
+
+impl RenderQueue {
+    pub fn new(queue: Queue) -> Self {
+        Self {
+            queue: WgpuQueue::new(queue),
+            submission: Arc::new(SubmissionCoordinator::default()),
+        }
+    }
+
+    pub fn into_inner(self) -> Queue {
+        self.wait_for_pending_submission();
+        self.queue.into_inner()
+    }
+
+    #[inline]
+    pub fn wait_for_pending_submission(&self) {
+        self.submission.wait();
+    }
+
+    pub fn last_frame_submission(&self) -> Option<FrameSubmissionHandle> {
+        self.submission.last_submission()
+    }
+
+    pub(crate) fn submit_frame_async(
+        &self,
+        commands: Vec<PendingCommandBuffer>,
+        presents: Vec<SurfaceTexture>,
+        synchronous: bool,
+    ) -> FrameSubmissionHandle {
+        self.submission
+            .submit_frame(&self.queue, commands, presents, synchronous)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn submission_sync(&self) -> Arc<SubmissionSync> {
+        self.submission.sync()
+    }
+}
+
+impl core::ops::Deref for RenderQueue {
+    type Target = Queue;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.wait_for_pending_submission();
+        &self.queue
+    }
+}
+
+impl core::ops::DerefMut for RenderQueue {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.wait_for_pending_submission();
+        &mut self.queue
+    }
 }
 
 const GPU_NOT_FOUND_ERROR_MESSAGE: &str = if cfg!(target_os = "linux") {

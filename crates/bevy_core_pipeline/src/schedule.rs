@@ -274,6 +274,9 @@ pub(crate) fn submit_pending_command_buffers(
     state: &mut SystemState<(ResMut<PendingCommandBuffers>, Res<RenderQueue>)>,
 ) {
     let (mut pending, queue) = state.get_mut(world).unwrap();
+    if pending.defers_submit_to_render_system() {
+        return;
+    }
     #[cfg(feature = "trace")]
     let buffer_count = pending.len();
     let mut buffers = pending.finish().peekable();
@@ -312,7 +315,6 @@ pub(crate) fn handle_uncovered_swap_chains(
     }
 
     let render_device = world.resource::<RenderDevice>();
-    let render_queue = world.resource::<RenderQueue>();
 
     let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor::default());
 
@@ -340,5 +342,7 @@ pub(crate) fn handle_uncovered_swap_chains(
         encoder.begin_render_pass(&pass_descriptor);
     }
 
-    render_queue.submit([encoder.finish()]);
+    world
+        .resource_mut::<PendingCommandBuffers>()
+        .push_encoder(encoder, "no_camera_clear_pass");
 }

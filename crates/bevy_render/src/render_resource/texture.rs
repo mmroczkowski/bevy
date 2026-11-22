@@ -89,6 +89,10 @@ impl SurfaceTexture {
     pub fn present(self, render_queue: &RenderQueue) {
         render_queue.present(self.value.into_inner());
     }
+
+    pub(crate) fn present_on_raw_queue(self, queue: &wgpu::Queue) {
+        queue.present(self.value.into_inner());
+    }
 }
 
 impl TextureView {

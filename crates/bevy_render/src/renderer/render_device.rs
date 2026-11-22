@@ -1,4 +1,6 @@
 use super::RenderQueue;
+#[cfg(not(target_arch = "wasm32"))]
+use super::submission::SubmissionSync;
 use crate::render_resource::{
     BindGroup, BindGroupLayout, Buffer, ComputePipeline, RawMeshPipelineDescriptor,
     RawRenderPipelineDescriptor, RenderPipeline, Sampler, Texture,
@@ -22,6 +24,8 @@ wgpu_wrapper! {
 pub struct RenderDevice {
     device: WgpuDevice,
     bind_groups_made_lately: Arc<BindGroupsMadeLately>,
+    #[cfg(not(target_arch = "wasm32"))]
+    submission_sync: Option<Arc<SubmissionSync>>,
 }
 
 impl From<wgpu::Device> for RenderDevice {
@@ -35,7 +39,15 @@ impl RenderDevice {
         Self {
             device: WgpuDevice::new(device),
             bind_groups_made_lately: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            submission_sync: None,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn with_submission_sync(mut self, submission_sync: Arc<SubmissionSync>) -> Self {
+        self.submission_sync = Some(submission_sync);
+        self
     }
 
     /// List all [`Features`](wgpu::Features) that may be used with this device.
@@ -132,6 +144,17 @@ impl RenderDevice {
     /// no-op on the web, device is automatically polled.
     #[inline]
     pub fn poll(&self, maintain: wgpu::PollType) -> Result<PollStatus, PollError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(
+            maintain,
+            wgpu::PollType::Wait {
+                submission_index: None,
+                ..
+            }
+        ) && let Some(sync) = &self.submission_sync
+        {
+            sync.wait();
+        }
         self.device.poll(maintain)
     }
 

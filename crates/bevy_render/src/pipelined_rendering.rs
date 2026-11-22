@@ -12,7 +12,7 @@ use bevy_ecs::{
 };
 use bevy_tasks::ComputeTaskPool;
 
-use crate::RenderApp;
+use crate::{renderer::RenderQueue, RenderApp};
 
 /// A Label for the sub app that runs the parts of pipelined rendering that need to run on the main thread.
 ///
@@ -73,13 +73,18 @@ impl Drop for RenderAppChannels {
             // A blocking receive would deadlock if the final render update has queued
             // main-thread tasks. Pump their executor while waiting, as renderer_extract does.
             let result = catch_unwind(AssertUnwindSafe(|| {
-                ComputeTaskPool::get().scope_with_executor(
-                    true,
-                    Some(&self.main_thread_executor.0),
-                    |scope| {
+                let render_app = ComputeTaskPool::get()
+                    .scope_with_executor(true, Some(&self.main_thread_executor.0), |scope| {
                         scope.spawn(async { self.render_to_app_receiver.recv().await.ok() });
-                    },
-                );
+                    })
+                    .pop()
+                    .flatten();
+                if let Some(render_app) = render_app {
+                    if let Some(queue) = render_app.world().get_resource::<RenderQueue>() {
+                        queue.wait_for_pending_submission();
+                    }
+                    drop(render_app);
+                }
             }));
 
             if let Err(payload) = result {

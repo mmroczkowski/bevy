@@ -557,6 +557,12 @@ impl SpecializedRenderPipeline for ScreenshotToScreenPipeline {
 pub(crate) type SubmitScreenshotCommandsState<'w, 's> =
     Query<'w, 's, (MainEntity, &'s ExtractedWindow)>;
 
+pub(crate) fn has_pending_screenshots(world: &World) -> bool {
+    world
+        .get_resource::<RenderScreenshotTargets>()
+        .is_some_and(|targets| !targets.is_empty())
+}
+
 pub(crate) fn submit_screenshot_commands(
     world: &World,
     state: &mut SystemState<SubmitScreenshotCommandsState>,

@@ -124,6 +124,7 @@ fn extract_windows(
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
     mut removed_primary: Extract<RemovedComponents<PrimaryWindow>>,
     mapper: Extract<Query<&RenderEntity>>,
+    render_queue: Option<Res<RenderQueue>>,
 ) {
     for (render_entity, window, handle, is_primary) in windows.iter() {
         if is_primary {
@@ -201,7 +202,14 @@ fn extract_windows(
     // window entity is actually destroyed. Here we only tear down the surface and drop the
     // extracted window data; extraction and `create_surfaces` will recreate them whenever the
     // window has a (new) `RawHandleWrapper` again.
+    let mut waited_for_submission = false;
     for closing_window in closing.read() {
+        if !waited_for_submission {
+            if let Some(queue) = &render_queue {
+                queue.wait_for_pending_submission();
+            }
+            waited_for_submission = true;
+        }
         if let Ok(render_entity) = mapper.get(closing_window.window) {
             commands
                 .entity(render_entity.entity())
@@ -209,6 +217,12 @@ fn extract_windows(
         }
     }
     for removed_window in removed.read() {
+        if !waited_for_submission {
+            if let Some(queue) = &render_queue {
+                queue.wait_for_pending_submission();
+            }
+            waited_for_submission = true;
+        }
         if let Ok(render_entity) = mapper.get(removed_window) {
             commands
                 .entity(render_entity.entity())
@@ -258,6 +272,7 @@ pub struct SurfaceData {
 pub fn prepare_windows(
     mut windows: Query<(MainEntity, &mut ExtractedWindow, Option<&SurfaceData>)>,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     sorted_cameras: Res<crate::camera::SortedCameras>,
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
 ) {
@@ -310,6 +325,8 @@ pub fn prepare_windows(
                 });
             })[0]
         };
+
+        render_queue.wait_for_pending_submission();
 
         let surface = &surface_data.surface;
         match surface.get_current_texture() {
@@ -379,6 +396,7 @@ pub fn create_surfaces(
     render_instance: Res<RenderInstance>,
     render_adapter: Res<RenderAdapter>,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
 ) {
     for (entity, mut window, handle, mut maybe_surface_data) in &mut windows {
         let Some(data) = maybe_surface_data.as_mut() else {
@@ -451,6 +469,7 @@ pub fn create_surfaces(
         };
 
         if window.size_changed || window.present_mode_changed {
+            render_queue.wait_for_pending_submission();
             // normally this is dropped on present but we double check here to be safe as failure to
             // drop it will cause validation errors in wgpu
             drop(window.swap_chain_texture.take());

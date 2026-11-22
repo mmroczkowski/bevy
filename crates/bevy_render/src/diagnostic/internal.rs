@@ -510,6 +510,16 @@ impl FrameData {
         };
 
         encoder.copy_buffer_to_buffer(resolve_buffer, 0, read_buffer, 0, self.buffer_size);
+
+        let is_mapped = self.is_mapped.clone();
+        encoder.map_buffer_on_submit(read_buffer, MapMode::Read, .., move |res| {
+            if let Err(e) = res {
+                bevy_log::warn!("Failed to download render statistics buffer: {e}");
+                return;
+            }
+
+            is_mapped.store(true, Ordering::Release);
+        });
     }
 
     fn diagnostic_path(&self, range: &Range<usize>, field: &str) -> DiagnosticPath {
@@ -521,7 +531,7 @@ impl FrameData {
     }
 
     fn finish(&mut self, callback: impl FnOnce(RenderDiagnostics) + Send + Sync + 'static) {
-        let Some(read_buffer) = &self.read_buffer else {
+        let Some(_read_buffer) = &self.read_buffer else {
             // we still have cpu timings, so let's use them
 
             let mut diagnostics = Vec::new();
@@ -557,16 +567,6 @@ impl FrameData {
         };
 
         self.callback = Some(Box::new(callback));
-
-        let is_mapped = self.is_mapped.clone();
-        read_buffer.slice(..).map_async(MapMode::Read, move |res| {
-            if let Err(e) = res {
-                bevy_log::warn!("Failed to download render statistics buffer: {e}");
-                return;
-            }
-
-            is_mapped.store(true, Ordering::Release);
-        });
     }
 
     // returns true if the frame is considered finished, false otherwise

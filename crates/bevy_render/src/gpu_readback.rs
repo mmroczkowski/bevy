@@ -364,6 +364,12 @@ fn prepare_buffers(
     }
 }
 
+pub(crate) fn has_pending_readbacks(world: &World) -> bool {
+    world
+        .get_resource::<GpuReadbacks>()
+        .is_some_and(|readbacks| !readbacks.requested.is_empty())
+}
+
 pub(crate) fn submit_readback_commands(world: &World, command_encoder: &mut CommandEncoder) {
     let readbacks = world.resource::<GpuReadbacks>();
     for readback in &readbacks.requested {
