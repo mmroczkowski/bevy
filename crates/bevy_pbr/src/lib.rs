@@ -129,6 +129,12 @@ pub struct PbrPlugin {
     pub prepass_enabled: bool,
     /// Controls if [`DeferredPbrLightingPlugin`] is added.
     pub add_default_deferred_lighting_plugin: bool,
+    /// Controls if [`ScreenSpaceAmbientOcclusionPlugin`] is added.
+    pub add_ssao_plugin: bool,
+    /// Controls if [`VolumetricFogPlugin`] is added.
+    pub add_volumetric_fog_plugin: bool,
+    /// Controls if [`AtmospherePlugin`] is added.
+    pub add_atmosphere_plugin: bool,
     /// Controls if GPU [`MeshUniform`] building is enabled.
     ///
     /// This requires compute shader support and so will be forcibly disabled if
@@ -145,6 +151,9 @@ impl Default for PbrPlugin {
         Self {
             prepass_enabled: true,
             add_default_deferred_lighting_plugin: true,
+            add_ssao_plugin: true,
+            add_volumetric_fog_plugin: true,
+            add_atmosphere_plugin: true,
             use_gpu_instance_buffer_builder: true,
             debug_flags: RenderDebugFlags::default(),
             gltf_enable_standard_materials: true,
@@ -218,7 +227,6 @@ impl Plugin for PbrPlugin {
                     debug_flags: self.debug_flags,
                     ..Default::default()
                 },
-                ScreenSpaceAmbientOcclusionPlugin,
                 FogPlugin,
                 ExtractResourcePlugin::<DefaultOpaqueRendererMethod>::default(),
                 SyncComponentPlugin::<ShadowFilteringMethod, Self>::default(),
@@ -227,7 +235,6 @@ impl Plugin for PbrPlugin {
                 GpuMeshPreprocessPlugin {
                     use_gpu_instance_buffer_builder: self.use_gpu_instance_buffer_builder,
                 },
-                VolumetricFogPlugin,
                 ScreenSpaceReflectionsPlugin,
                 ScreenSpaceTransmissionPlugin,
                 ClusteredDecalPlugin,
@@ -241,11 +248,24 @@ impl Plugin for PbrPlugin {
                 SyncComponentPlugin::<RectLight, Self>::default(),
                 SyncComponentPlugin::<AmbientLight, Self>::default(),
             ))
-            .add_plugins((
-                ScatteringMediumPlugin,
-                AtmospherePlugin,
-                GpuClusteringPlugin,
-            ));
+            .add_plugins((ScatteringMediumPlugin, GpuClusteringPlugin));
+
+        if self.add_ssao_plugin {
+            app.add_plugins(ScreenSpaceAmbientOcclusionPlugin);
+        } else {
+            load_shader_library!(app, "ssao/utils.wesl");
+        }
+        if self.add_volumetric_fog_plugin {
+            app.add_plugins(VolumetricFogPlugin);
+        }
+        if self.add_atmosphere_plugin {
+            app.add_plugins(AtmospherePlugin);
+        } else {
+            load_shader_library!(app, "atmosphere/types.wesl");
+            load_shader_library!(app, "atmosphere/functions.wesl");
+            load_shader_library!(app, "atmosphere/bruneton_functions.wesl");
+            load_shader_library!(app, "atmosphere/bindings.wesl");
+        }
 
         #[cfg(feature = "bevy_gltf")]
         if self.gltf_enable_standard_materials {

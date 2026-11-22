@@ -2964,6 +2964,16 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
 ) {
     let view_lights = view.into_inner();
 
+    if IS_LATE
+        && !view_lights.lights.iter().any(|&view_light_entity| {
+            view_light_query
+                .get(view_light_entity)
+                .is_ok_and(|(_, _, occlusion_culling, ..)| occlusion_culling)
+        })
+    {
+        return;
+    }
+
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let time_span = diagnostics.time_span(ctx.command_encoder(), "per_view_shadow_pass");
@@ -2980,6 +2990,10 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
         else {
             continue;
         };
+
+        if IS_LATE && !occlusion_culling {
+            continue;
+        }
 
         // Make sure to build indirect parameters here, as the normal
         // `*_prepass_build_indirect_parameters` functions only run for root
