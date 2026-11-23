@@ -100,6 +100,138 @@ pub struct QueryState<D: QueryData, F: QueryFilter = ()> {
     par_iter_span: Span,
 }
 
+/// The parts of a [`QueryState`] that do not depend on its query types, so matching archetypes
+/// compiles once instead of once for every query type.
+struct MatchedStorages<'a> {
+    archetype_generation: &'a mut ArchetypeGeneration,
+    matched_tables: &'a mut FixedBitSet,
+    matched_archetypes: &'a mut FixedBitSet,
+    matched_storage_ids: &'a mut Vec<StorageId>,
+    component_access: &'a FilteredAccess,
+    is_dense: bool,
+}
+
+impl MatchedStorages<'_> {
+    fn update(&mut self, world: UnsafeWorldCell, matches_query: &dyn Fn(&Archetype) -> bool) {
+        if self.component_access.required.is_clear() {
+            let archetypes = world.archetypes();
+            let old_generation =
+                core::mem::replace(self.archetype_generation, archetypes.generation());
+
+            for archetype in &archetypes[old_generation..] {
+                self.new_archetype(archetype, matches_query);
+            }
+        } else {
+            // skip if we are already up to date
+            if *self.archetype_generation == world.archetypes().generation() {
+                return;
+            }
+            // if there are required components, we can optimize by only iterating through archetypes
+            // that contain at least one of the required components
+            let potential_archetypes = self
+                .component_access
+                .required
+                .iter()
+                .filter_map(|component_id| {
+                    world
+                        .archetypes()
+                        .component_index()
+                        .get(&component_id)
+                        .map(|index| index.keys())
+                })
+                // select the component with the fewest archetypes
+                .min_by_key(ExactSizeIterator::len);
+            if let Some(archetypes) = potential_archetypes {
+                for archetype_id in archetypes {
+                    // exclude archetypes that have already been processed
+                    if archetype_id < &self.archetype_generation.0 {
+                        continue;
+                    }
+                    let archetype = &world.archetypes()[*archetype_id];
+                    self.new_archetype(archetype, matches_query);
+                }
+            }
+            *self.archetype_generation = world.archetypes().generation();
+        }
+    }
+
+    fn new_archetype(&mut self, archetype: &Archetype, matches_query: &dyn Fn(&Archetype) -> bool) {
+        if matches_query(archetype)
+            && access_matches_component_set(self.component_access, &|id| archetype.contains(id))
+        {
+            let archetype_index = archetype.id().index();
+            if !self.matched_archetypes.contains(archetype_index) {
+                self.matched_archetypes.grow_and_insert(archetype_index);
+                if !self.is_dense {
+                    self.matched_storage_ids.push(StorageId {
+                        archetype_id: archetype.id(),
+                    });
+                }
+            }
+            let table_index = archetype.table_id().as_usize();
+            if !self.matched_tables.contains(table_index) {
+                self.matched_tables.grow_and_insert(table_index);
+                if self.is_dense {
+                    self.matched_storage_ids.push(StorageId {
+                        table_id: archetype.table_id(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn access_matches_component_set(
+    component_access: &FilteredAccess,
+    set_contains_id: &dyn Fn(ComponentId) -> bool,
+) -> bool {
+    component_access.filter_sets.iter().any(|set| {
+        set.with.iter().all(set_contains_id)
+            && set.without.iter().all(|index| !set_contains_id(index))
+    })
+}
+
+fn add_access_or_panic_on_conflict(
+    component_access: &FilteredAccess,
+    query_type_name: fn() -> DebugName,
+    system_name: Option<&str>,
+    component_access_set: &mut FilteredAccessSet,
+    world: UnsafeWorldCell,
+) {
+    let conflicts = component_access_set.get_conflicts_single(component_access);
+    if !conflicts.is_empty() {
+        let mut accesses = conflicts.format_conflict_list(world);
+        // Access list may be empty (if access to all components requested)
+        if !accesses.is_empty() {
+            accesses.push(' ');
+        }
+        let type_name = query_type_name();
+        let type_name = type_name.shortname();
+        let system = system_name
+            .map(|name| format!(" in system {name}"))
+            .unwrap_or_default();
+        panic!("error[B0001]: {type_name}{system} accesses component(s) {accesses}in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevy.org/learn/errors/b0001",);
+    }
+
+    component_access_set.add(component_access.clone());
+}
+
+/// Merges the filter access into the main access, so filter access is considered in a global
+/// "cross-query" context, and applies the world's default query filters.
+fn access_with_default_filters(
+    world: &World,
+    mut component_access: FilteredAccess,
+    filter_component_access: &FilteredAccess,
+    mut is_dense: bool,
+) -> (FilteredAccess, bool) {
+    component_access.extend(filter_component_access);
+    if let Some(default_filters) = world.get_resource::<DefaultQueryFilters>() {
+        default_filters.modify_access(&mut component_access);
+        is_dense &= default_filters.is_dense(world.components());
+    }
+    (component_access, is_dense)
+}
+
 impl<D: QueryData, F: QueryFilter> fmt::Debug for QueryState<D, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryState")
@@ -201,22 +333,13 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         component_access_set: &mut FilteredAccessSet,
         world: UnsafeWorldCell,
     ) {
-        let conflicts = component_access_set.get_conflicts_single(&self.component_access);
-        if !conflicts.is_empty() {
-            let mut accesses = conflicts.format_conflict_list(world);
-            // Access list may be empty (if access to all components requested)
-            if !accesses.is_empty() {
-                accesses.push(' ');
-            }
-            let type_name = DebugName::type_name::<Query<D, F>>();
-            let type_name = type_name.shortname();
-            let system = system_name
-                .map(|name| format!(" in system {name}"))
-                .unwrap_or_default();
-            panic!("error[B0001]: {type_name}{system} accesses component(s) {accesses}in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevy.org/learn/errors/b0001",);
-        }
-
-        component_access_set.add(self.component_access.clone());
+        add_access_or_panic_on_conflict(
+            &self.component_access,
+            || DebugName::type_name::<Query<D, F>>(),
+            system_name,
+            component_access_set,
+            world,
+        );
         D::init_nested_access(&self.fetch_state, system_name, component_access_set, world);
         F::init_nested_access(&self.filter_state, system_name, component_access_set, world);
     }
@@ -269,18 +392,14 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         let mut filter_component_access = FilteredAccess::default();
         F::update_component_access(&filter_state, &mut filter_component_access);
 
-        // Merge the temporary filter access with the main access. This ensures that filter access is
-        // properly considered in a global "cross-query" context (both within systems and across systems).
-        component_access.extend(&filter_component_access);
-
         // For queries without dynamic filters the dense-ness of the query is equal to the dense-ness
         // of its static type parameters.
-        let mut is_dense = D::IS_DENSE && F::IS_DENSE;
-
-        if let Some(default_filters) = world.get_resource::<DefaultQueryFilters>() {
-            default_filters.modify_access(&mut component_access);
-            is_dense &= default_filters.is_dense(world.components());
-        }
+        let (component_access, is_dense) = access_with_default_filters(
+            world,
+            component_access,
+            &filter_component_access,
+            D::IS_DENSE && F::IS_DENSE,
+        );
 
         // SAFETY: Caller ensures `init_access` is called
         Self {
@@ -566,55 +685,23 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         self.validate_world(world.id());
         D::update_archetypes(&mut self.fetch_state, world);
         F::update_archetypes(&mut self.filter_state, world);
-        if self.component_access.required.is_clear() {
-            let archetypes = world.archetypes();
-            let old_generation =
-                core::mem::replace(&mut self.archetype_generation, archetypes.generation());
-
-            for archetype in &archetypes[old_generation..] {
-                // SAFETY: The validate_world call ensures that the world is the same the QueryState
-                // was initialized from.
-                unsafe {
-                    self.new_archetype(archetype);
-                }
-            }
-        } else {
-            // skip if we are already up to date
-            if self.archetype_generation == world.archetypes().generation() {
-                return;
-            }
-            // if there are required components, we can optimize by only iterating through archetypes
-            // that contain at least one of the required components
-            let potential_archetypes = self
-                .component_access
-                .required
-                .iter()
-                .filter_map(|component_id| {
-                    world
-                        .archetypes()
-                        .component_index()
-                        .get(&component_id)
-                        .map(|index| index.keys())
-                })
-                // select the component with the fewest archetypes
-                .min_by_key(ExactSizeIterator::len);
-            if let Some(archetypes) = potential_archetypes {
-                for archetype_id in archetypes {
-                    // exclude archetypes that have already been processed
-                    if archetype_id < &self.archetype_generation.0 {
-                        continue;
-                    }
-                    // SAFETY: get_potential_archetypes only returns archetype ids that are valid for the world
-                    let archetype = &world.archetypes()[*archetype_id];
-                    // SAFETY: The validate_world call ensures that the world is the same the QueryState
-                    // was initialized from.
-                    unsafe {
-                        self.new_archetype(archetype);
-                    }
-                }
-            }
-            self.archetype_generation = world.archetypes().generation();
+        if self.archetype_generation == world.archetypes().generation() {
+            return;
         }
+        let fetch_state = &self.fetch_state;
+        let filter_state = &self.filter_state;
+        MatchedStorages {
+            archetype_generation: &mut self.archetype_generation,
+            matched_tables: &mut self.matched_tables,
+            matched_archetypes: &mut self.matched_archetypes,
+            matched_storage_ids: &mut self.matched_storage_ids,
+            component_access: &self.component_access,
+            is_dense: self.is_dense,
+        }
+        .update(world, &|archetype| {
+            D::matches_component_set(fetch_state, &|id| archetype.contains(id))
+                && F::matches_component_set(filter_state, &|id| archetype.contains(id))
+        });
     }
 
     /// # Panics
@@ -644,37 +731,25 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     /// # Safety
     /// `archetype` must be from the `World` this state was initialized from.
     pub unsafe fn new_archetype(&mut self, archetype: &Archetype) {
-        if D::matches_component_set(&self.fetch_state, &|id| archetype.contains(id))
-            && F::matches_component_set(&self.filter_state, &|id| archetype.contains(id))
-            && self.matches_component_set(&|id| archetype.contains(id))
-        {
-            let archetype_index = archetype.id().index();
-            if !self.matched_archetypes.contains(archetype_index) {
-                self.matched_archetypes.grow_and_insert(archetype_index);
-                if !self.is_dense {
-                    self.matched_storage_ids.push(StorageId {
-                        archetype_id: archetype.id(),
-                    });
-                }
-            }
-            let table_index = archetype.table_id().as_usize();
-            if !self.matched_tables.contains(table_index) {
-                self.matched_tables.grow_and_insert(table_index);
-                if self.is_dense {
-                    self.matched_storage_ids.push(StorageId {
-                        table_id: archetype.table_id(),
-                    });
-                }
-            }
+        let fetch_state = &self.fetch_state;
+        let filter_state = &self.filter_state;
+        MatchedStorages {
+            archetype_generation: &mut self.archetype_generation,
+            matched_tables: &mut self.matched_tables,
+            matched_archetypes: &mut self.matched_archetypes,
+            matched_storage_ids: &mut self.matched_storage_ids,
+            component_access: &self.component_access,
+            is_dense: self.is_dense,
         }
+        .new_archetype(archetype, &|archetype| {
+            D::matches_component_set(fetch_state, &|id| archetype.contains(id))
+                && F::matches_component_set(filter_state, &|id| archetype.contains(id))
+        });
     }
 
     /// Returns `true` if this query matches a set of components. Otherwise, returns `false`.
     pub fn matches_component_set(&self, set_contains_id: &impl Fn(ComponentId) -> bool) -> bool {
-        self.component_access.filter_sets.iter().any(|set| {
-            set.with.iter().all(set_contains_id)
-                && set.without.iter().all(|index| !set_contains_id(index))
-        })
+        access_matches_component_set(&self.component_access, set_contains_id)
     }
 
     /// Use this to transform a [`QueryState`] into a more generic [`QueryState`].
